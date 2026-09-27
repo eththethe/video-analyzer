@@ -1,0 +1,14 @@
+# Secrets: API keys and the Meta access token
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Source videos (about 12 GB; the copies used for judging live in the GCS bucket)
+vid/
+
+# Generated output: judged results, grouping plans, Meta exports and API cache.
+# Each run writes new timestamped files, so history is kept on disk, not in git.
+judging/results/
