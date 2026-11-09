@@ -1,0 +1,58 @@
+{
+  "model": "convaiinnovations/laya-multilingual",
+  "levels": [
+    "broken or absent: seriously obstructs this job (0-20)",
+    "weak: substantial revision needed (21-40)",
+    "average: functional but ordinary (41-60)",
+    "strong: clear, specific strengths (61-80)",
+    "exceptional: strong evidence, few weaknesses (81-95)"
+  ],
+  "level_scores": [10, 30, 50, 70, 88],
+  "metrics": {
+    "hooks": {
+      "hook_relevance": "Does the opening make the intended viewer (Malaysians 50+ worried about kidney, blood sugar, blood pressure or cholesterol, or their adult children) recognise a meaningful concern or objection?",
+      "hook_payoff": "Does the rest of the ad actually answer the opening promise, without bait-and-switch?"
+    },
+    "format_topic": {
+      "topic_relevance": "How relevant is the topic to this audience, to Sahiyya's positioning and to the ad's funnel job?",
+      "message_clarity": "Is there one dominant takeaway with an understandable problem-to-explanation-to-solution progression?",
+      "format_fit": "Does the format (talking head, testimonial, interview, skit...) make the explanation or persuasion credible and easy?",
+      "audience_language_fit": "Is the Malay natural and respectful, with familiar vocabulary, manageable sentences and little jargon for viewers aged 50+?",
+      "persuasion_logic": "Is the argument coherent, with no unexplained leap from a symptom to the product or from an ingredient name to a promised outcome?"
+    },
+    "speech": {
+      "emotional_resonance": "Does the ad create relevant concern, reassurance, hope or family motivation with a believable resolution (not shame or extreme fear)?"
+    },
+    "product_sales": {
+      "cta_strength": "How strong is the call to action: a clear next step, an understandable destination, and a compelling reason to take it now?",
+      "click_motivation": "Does the viewer gain something specific and relevant by clicking or enquiring?",
+      "purchase_desire": "Does the viewer understand why Sahiyya is worth choosing and paying for?",
+      "proof_trust": "Is the evidence relevant, specific and proportionate to the actual claim or objection?",
+      "offer_urgency": "How clear and credible is the offer, bundle or deadline?",
+      "usp_translation": "Does the ad connect a product feature to a consumer benefit and a reason to choose Sahiyya?",
+      "objection_resolution": "Does the buyer objection raised in the ad get a convincing, supportable answer?",
+      "enquiry_quality": "Does the ad set accurate expectations and give a useful reason to contact the team?"
+    }
+  },
+  "gates": {
+    "offer_urgency": "Does the ad present an offer, discount, bundle, free gift or deadline?",
+    "usp_translation": "Does the ad try to explain what makes Sahiyya different from other options?",
+    "objection_resolution": "Does the ad raise or address a buyer's doubt or objection (price, safety, fake products, use with medicine, results)?",
+    "enquiry_quality": "Does the ad ask viewers to enquire, comment, message or WhatsApp the team?"
+  },
+  "labels": {
+    "funnel_stage": {
+      "type": "choice",
+      "instructions": "Which funnel stage does this ad mainly serve?",
+      "criteria": {
+        "TOFU": "awareness, relevant education or problem recognition",
+        "MOFU": "understanding the solution, differentiation, trust or resolving objections",
+        "BOFU": "a purchase decision, buying reassurance, an offer or a closing objection"
+      }
+    },
+    "medical_claim": {
+      "type": "noul",
+      "instructions": "Does the ad claim or imply that the product cures, treats, prevents or reverses a disease, replaces medicine, or avoids dialysis or surgery?"
+    }
+  }
+}

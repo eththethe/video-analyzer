@@ -10,9 +10,10 @@ Setup (once):
     GCS_BUCKET=testsadawee              # videos are uploaded here once and reused
     PANEL_MODELS=gemini-3.8-flash,gemini-3.1-pro-preview
 
-Prompts (edit these, not this file):
-    prompts/scoring_prompt.md   the system prompt; {context} is replaced by
-    prompts/context.md          the account context shared with group.py
+Prompts (edit these, not this file), versioned by file name, newest wins:
+    prompts/<YYMMDD><letter>_prompt_scoring.md   the system prompt; {context} is
+    prompts/<YYMMDD><letter>_prompt_context.md   replaced by the context shared
+                                                 with group.py (same or older version)
 
 Usage:
     python judging/gemini.py                     # judge everything in vid/
@@ -20,19 +21,24 @@ Usage:
     python judging/gemini.py --limit 3           # quick test run
     python judging/gemini.py --force             # re-judge already scored videos
     python judging/gemini.py --workers 2         # videos judged in parallel (default 3)
+    python judging/gemini.py --gcs "SUPERSTAR AI/" --exclude "SUPERSTAR AI/Awareness/" --tag superstar-ai
+                                                 # judge videos already in the bucket (subfolders
+                                                 # included); the CSV holds only those videos and is
+                                                 # named results_<model>_<stamp>_<tag>.csv
 
 Every model in PANEL_MODELS watches every video and does the full job on its
 own: evidence breakdown, scene-by-scene description, then the judgement defined
 in the scoring prompt. Results per (video, model) are appended to
 judging/results/results.jsonl (resumable: a failed model is retried on the next
 run without redoing the others). Each run writes its own CSV per model,
-judging/results/results_<model>_<YYYYmmdd_HHMMSS>.csv, holding every judged video
+judging/results/result_scoring/results_<model>_<YYYYmmdd_HHMMSS>.csv, holding every judged video
 for that model (not just this run's), rewritten after every video and sorted by
 creative score. Earlier runs' CSVs are never overwritten.
 
-Every record carries judged_at and prompt_version, a short fingerprint of the
-exact scoring prompt (context included), so score changes can be traced to a
-prompt change rather than a video change.
+Every record carries judged_at, prompt_file (e.g. 260927a_prompt_scoring.md)
+and prompt_version, a short fingerprint of the exact scoring prompt (context
+included), so score changes can be traced to a prompt change rather than a
+video change.
 
 Scoring (computed here from the model's metric scores, as the prompt defines it)
     section_score   = mean of the section's applicable, observed metrics
@@ -55,8 +61,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from statistics import mean
-from typing import Literal
+from typing import Literal, NamedTuple
 
+import httpx
 from google import genai
 from google.cloud import storage
 from google.genai import errors, types
@@ -66,7 +73,8 @@ ROOT = Path(__file__).resolve().parent.parent
 VIDEO_DIR = ROOT / "vid"
 PROMPTS_DIR = ROOT / "prompts"
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
-JSONL_PATH = RESULTS_DIR / "results.jsonl"
+JSONL_PATH = RESULTS_DIR / "results.jsonl"  # every judgement; group.py reads it, reruns resume from it
+SCORING_DIR = RESULTS_DIR / "result_scoring"
 
 RUBRIC_VERSION = 6  # bump when the schema/rubric changes; old records are ignored
 DEFAULT_MODELS = "gemini-3.8-flash,gemini-3.1-pro-preview"
@@ -97,16 +105,29 @@ def run_stamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
-def load_prompt(name: str, **values: str) -> str:
-    """prompts/<name>.md with {context} and any other {key} placeholders filled in."""
-    text = (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
-    values.setdefault("context", (PROMPTS_DIR / "context.md").read_text(encoding="utf-8").strip())
+def prompt_path(kind: str, version: str | None = None, ext: str = "md") -> Path:
+    """prompts/<version>_prompt_<kind>.<ext>: the newest version (names sort by YYMMDD + letter) at or
+    below `version`, or the newest overall when version is None."""
+    files = [p for p in sorted(PROMPTS_DIR.glob(f"*_prompt_{kind}.{ext}"))
+             if version is None or p.name.split("_")[0] <= version]
+    if not files:
+        raise FileNotFoundError(f"no prompts/*_prompt_{kind}.{ext}" + (f" at or before {version}" if version else ""))
+    return files[-1]
+
+
+def load_prompt(kind: str, **values: str) -> str:
+    """Newest prompts/*_prompt_<kind>.md with {context} and any other {key} placeholders filled in.
+    {context} comes from the newest *_prompt_context.md at or below the prompt's own version."""
+    path = prompt_path(kind)
+    text = path.read_text(encoding="utf-8")
+    if "{context}" in text and "context" not in values:
+        values["context"] = prompt_path("context", path.name.split("_")[0]).read_text(encoding="utf-8").strip()
     for key, value in values.items():
         text = text.replace("{" + key + "}", value)
     return text
 
 
-# --- Output schema (mirrors prompts/scoring_prompt.md) ------------------------
+# --- Output schema (mirrors prompts/*_prompt_scoring.md) ---------------------
 
 Confidence = Literal["high", "medium", "low"]
 
@@ -374,6 +395,8 @@ class Observation(BaseModel):
     evidence: Evidence
     detailed_description: str = Field(description="Step 2: scene-by-scene description")
     summary: str = Field(description="Neutral 2-3 sentence summary")
+    short_summary: str = Field(description="At most 25 words for a media buyer: who, what happens or is argued, "
+                                           "the angle, and the CTA or 'no CTA'")
     content_clearance: Literal["relevant", "unrelated", "insufficient_evidence"]
     positioning: Positioning
     funnel: Funnel
@@ -438,6 +461,12 @@ def make_client() -> genai.Client:
     )
 
 
+class Video(NamedTuple):
+    name: str          # file name; the video's key in results.jsonl and the CSVs
+    path: Path | None  # local file, uploaded to GCS before judging
+    uri: str | None    # gs:// URI when the video is already in the bucket
+
+
 def upload_video(path: Path) -> str:
     """Upload to GCS once (skipped if already there) and return the gs:// URI."""
     bucket_name = os.environ.get("GCS_BUCKET")
@@ -448,6 +477,29 @@ def upload_video(path: Path) -> str:
     if not blob.exists():
         blob.upload_from_filename(str(path), content_type="video/mp4", timeout=900)
     return f"gs://{bucket_name}/{blob.name}"
+
+
+def gcs_videos(prefixes: list[str], exclude: list[str] | None = None) -> list[Video]:
+    """Every .mp4 in GCS_BUCKET under any of `prefixes` (subfolders included), minus those under `exclude`."""
+    bucket_name = os.environ.get("GCS_BUCKET")
+    if not bucket_name:
+        raise RuntimeError("Set GCS_BUCKET in .env")
+    client = storage.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT"))
+    found: dict[str, tuple[str, Video]] = {}  # file name -> (content hash, first copy)
+    clashes = set()
+    for prefix in prefixes:
+        for blob in sorted(client.list_blobs(bucket_name, prefix=prefix), key=lambda b: b.name):
+            if not blob.name.lower().endswith(".mp4") or blob.name.startswith(tuple(exclude or ())):
+                continue
+            video = Video(blob.name.rsplit("/", 1)[-1], None, f"gs://{bucket_name}/{blob.name}")
+            # Results are keyed by file name: an identical copy in another folder is judged once,
+            # but two different videos sharing a name would overwrite each other.
+            if video.name in found and found[video.name][0] != blob.md5_hash:
+                clashes.add(video.name)
+            found.setdefault(video.name, (blob.md5_hash, video))
+    if clashes:
+        raise RuntimeError(f"Different videos share a file name: {', '.join(sorted(clashes))}")
+    return sorted(v for _, v in found.values())
 
 
 def generate(client: genai.Client, model: str, contents: list, system_prompt: str, schema: type[BaseModel]) -> BaseModel:
@@ -471,16 +523,23 @@ def generate(client: genai.Client, model: str, contents: list, system_prompt: st
             if e.code not in RETRY_CODES or attempt == 4:
                 raise
             time.sleep(15 * 2 ** attempt)  # 15s, 30s, 60s, 120s
+        except httpx.TransportError:  # dropped connection, e.g. a network blip on this machine
+            if attempt == 4:
+                raise
+            time.sleep(15 * 2 ** attempt)
+    finish = response.candidates[0].finish_reason if response.candidates else None
+    if finish == types.FinishReason.MAX_TOKENS:
+        raise RuntimeError(f"{schema.__name__}: the answer hit the output length limit and was cut off")
     if response.parsed is None:
         raise RuntimeError(f"{schema.__name__}: could not parse model output: {(response.text or '')[:500]}")
     return response.parsed
 
 
-def judge_video(client: genai.Client, model: str, uri: str, path: Path, system_prompt: str) -> tuple[Judgement, float]:
+def judge_video(client: genai.Client, model: str, uri: str, name: str, system_prompt: str) -> tuple[Judgement, float]:
     """Observe, score, then assess: three calls, each seeing the video and the earlier output."""
     start = time.perf_counter()
     video = types.Part.from_uri(file_uri=uri, mime_type="video/mp4")
-    intro = (f"Filename: {path.name}\nInput mode: full video with audio. No campaign brief, product playbook, "
+    intro = (f"Filename: {name}\nInput mode: full video with audio. No campaign brief, product playbook, "
              "approved-claims list, benchmark creatives or performance data are supplied.\n\n")
 
     obs = generate(client, model, [video, intro + (
@@ -562,30 +621,35 @@ def score_summary(j: dict) -> dict:
     }
 
 
-def aggregate(j: Judgement) -> dict:
-    """score_summary plus the provisional flag and the commercial readiness check on release status."""
-    summary = score_summary(j.model_dump())
-    release = j.release_status
+def aggregate(j: Judgement | dict) -> dict:
+    """score_summary plus the provisional flag and the commercial readiness check on release status.
+    Takes a Judgement or the same data as a dict (text_judge.py passes dicts)."""
+    j = j.model_dump() if isinstance(j, BaseModel) else j
+    summary = score_summary(j)
+    release = j["release_status"]
     failing = summary.pop("commercial_readiness_failures")
     if failing and release not in STRICTER_THAN_REVISE:
         release = "revise_before_testing"
     return {
         **{k: v for k, v in summary.items() if k not in ("missing_section", "unobserved_metric")},
-        "provisional": summary["missing_section"] or summary["unobserved_metric"] or j.assessment_status != "complete",
+        "provisional": summary["missing_section"] or summary["unobserved_metric"] or j["assessment_status"] != "complete",
         "release_status": release,
         "readiness": ("commercial readiness failed: " + ", ".join(failing)) if failing else "",
     }
 
 
-def to_record(path: Path, model: str, j: Judgement, seconds: float, prompt_version: str) -> dict:
+def to_record(name: str, uri: str, model: str, j: Judgement, seconds: float, prompt_file: str,
+              prompt_version: str) -> dict:
     return {
         "rubric_version": RUBRIC_VERSION,
+        "prompt_file": prompt_file,
         "prompt_version": prompt_version,
         "judged_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "file": path.name,
+        "file": name,
+        "gcs_uri": uri,
         "model": model,
         "funnel_stage": j.funnel.primary_stage,
-        "filename_stage": funnel_stage_from_name(path.name) or "",
+        "filename_stage": funnel_stage_from_name(name) or "",
         **aggregate(j),
         "seconds": round(seconds, 1),
         "judgement": j.model_dump(),
@@ -612,7 +676,7 @@ def short(model: str) -> str:
 CSV_COLUMNS = [
     "file",
     "creative_score", *SECTIONS, *ALL_METRICS, "cta_count", "compliance_flags_count",
-    "judged_at", "prompt_version",
+    "judged_at", "prompt_file", "prompt_version", "evidence_source",
     "funnel_stage", "filename_stage", "stage_confidence", "primary_objective", "weights_used",
     "provisional", "coverage", "release_status", "readiness", "brand_safety_tier", "verification_status",
     "commercial_verdict", "content_clearance",
@@ -622,11 +686,12 @@ CSV_COLUMNS = [
     *(f"{s}_insight" for s in SECTIONS),
     "prioritized_edits", "hook_alternatives", "recommended_cta", "product_transition", "ab_test",
     "compliance_flags", "claim_audit", "detailed_description", "shot_log", "transcript",
+    "short_summary",  # last, by request; empty for videos judged before prompt 260929a
 ]
 
 
-def csv_path(model: str, stamp: str) -> Path:
-    return RESULTS_DIR / f"results_{model}_{stamp}.csv"
+def csv_path(model: str, stamp: str, tag: str = "") -> Path:
+    return SCORING_DIR / f"results_{model}_{stamp}{'_' + tag if tag else ''}.csv"
 
 
 def section_insight(review: dict) -> str:
@@ -634,11 +699,12 @@ def section_insight(review: dict) -> str:
     return f"INSIGHT: {review['insight']}\nROOT CAUSE: {review['root_cause']}\nACTIONS: {actions}"
 
 
-def model_rows(records: dict[tuple[str, str], dict], model: str) -> list[dict]:
-    """One CSV row per video judged by this model, using only that model's output."""
+def model_rows(records: dict[tuple[str, str], dict], model: str, only: set[str] | None = None) -> list[dict]:
+    """One CSV row per video judged by this model (only the `only` file names, if given),
+    using only that model's output."""
     rows = []
     for (file, m), rec in records.items():
-        if m != model:
+        if m != model or (only is not None and file not in only):
             continue
         j = rec["judgement"]
         ev, ps, risk, v, pos = j["evidence"], j["product_sales"], j["risk"], j["verdict"], j["positioning"]
@@ -650,7 +716,9 @@ def model_rows(records: dict[tuple[str, str], dict], model: str) -> list[dict]:
             "cta_count": ps["cta_count"],
             "compliance_flags_count": len(risk["compliance_flags"]),
             "judged_at": rec.get("judged_at", ""),
+            "prompt_file": rec.get("prompt_file", ""),
             "prompt_version": rec.get("prompt_version", ""),
+            "evidence_source": rec.get("evidence_source", "watched the video"),
             "funnel_stage": rec["funnel_stage"],
             "filename_stage": rec["filename_stage"],
             "stage_confidence": j["funnel"]["confidence"],
@@ -695,6 +763,7 @@ def model_rows(records: dict[tuple[str, str], dict], model: str) -> list[dict]:
                 + (f" | AUDIO: {s['audio']}" if s["audio"] else "")
                 for s in ev["shots"]),
             "transcript": ev["transcript"],
+            "short_summary": j.get("short_summary", ""),
         })
     rows.sort(key=lambda r: (r["creative_score"] is not None, r["creative_score"] or 0), reverse=True)
     return rows
@@ -719,15 +788,28 @@ def main() -> int:
     parser.add_argument("--limit", type=int, help="judge at most N videos")
     parser.add_argument("--force", action="store_true", help="re-judge videos already in results")
     parser.add_argument("--workers", type=int, default=3, help="videos judged in parallel (default 3)")
+    parser.add_argument("--gcs", action="append", metavar="PREFIX",
+                        help="judge every .mp4 under this bucket folder instead of local files (repeatable)")
+    parser.add_argument("--exclude", action="append", metavar="PREFIX", help="skip bucket objects under this folder")
+    parser.add_argument("--tag", help="name for this set of videos; required with --gcs, added to the CSV name")
     args = parser.parse_args()
+    if args.gcs and args.paths:
+        parser.error("give either video files or --gcs, not both")
+    if args.gcs and not args.tag:
+        parser.error("--gcs needs --tag, so its CSV is told apart from the full-library CSVs")
 
     load_dotenv()
     models = [m.strip() for m in os.environ.get("PANEL_MODELS", DEFAULT_MODELS).split(",") if m.strip()]
-    system_prompt = load_prompt("scoring_prompt")
-    prompt_version = prompt_fingerprint(system_prompt)
+    system_prompt = load_prompt("scoring")
+    prompt_file, prompt_version = prompt_path("scoring").name, prompt_fingerprint(system_prompt)
     stamp = run_stamp()
+    tag = args.tag or ""
 
-    videos = args.paths or sorted(VIDEO_DIR.glob("*.mp4"))
+    if args.gcs:
+        videos = gcs_videos(args.gcs, args.exclude)
+    else:
+        videos = [Video(p.name, p, None) for p in (args.paths or sorted(VIDEO_DIR.glob("*.mp4")))]
+    only = {v.name for v in videos} if args.gcs else None  # a --gcs CSV holds just its own videos
     records = load_records()
     todo = []
     for v in videos:
@@ -738,19 +820,21 @@ def main() -> int:
     if args.limit:
         todo = todo[: args.limit]
     print(f"{len(videos)} videos, {already} already judged, {len(todo)} to go "
-          f"(panel: {', '.join(models)}; {args.workers} at a time; prompt {prompt_version})")
+          f"(panel: {', '.join(models)}; {args.workers} at a time; prompt {prompt_file} {prompt_version})")
+    if not todo:
+        return 0  # nothing new, so no new CSVs either
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    SCORING_DIR.mkdir(parents=True, exist_ok=True)
     client = make_client()
     lock = threading.Lock()
     state = {"done": 0, "failures": 0}
 
-    def process(path: Path, missing: list[str]) -> None:
+    def process(video: Video, missing: list[str]) -> None:
         lines = []
         try:
-            uri = upload_video(path)
+            uri = video.uri or upload_video(video.path)
             with ThreadPoolExecutor(len(missing)) as pool:
-                futures = {m: pool.submit(judge_video, client, m, uri, path, system_prompt) for m in missing}
+                futures = {m: pool.submit(judge_video, client, m, uri, video.name, system_prompt) for m in missing}
             for m, fut in futures.items():
                 try:
                     judgement, seconds = fut.result()
@@ -759,11 +843,11 @@ def main() -> int:
                         state["failures"] += 1
                     lines.append(f"    {short(m):22s} ERROR {type(e).__name__}: {str(e)[:300]}")
                     continue
-                rec = to_record(path, m, judgement, seconds, prompt_version)
+                rec = to_record(video.name, uri, m, judgement, seconds, prompt_file, prompt_version)
                 with lock:
                     with open(JSONL_PATH, "a", encoding="utf-8") as f:
                         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    records[(path.name, m)] = rec
+                    records[(video.name, m)] = rec
                 score = rec["creative_score"]
                 lines.append(f"    {short(m):22s} score {score if score is not None else 'n/a':>5}  "
                              f"{rec['funnel_stage']}  {rec['release_status']}  "
@@ -775,22 +859,22 @@ def main() -> int:
 
         with lock:
             state["done"] += 1
-            locked = [m for m in models if not write_csv(model_rows(records, m), csv_path(m, stamp))]
-            print("\n".join([f"[{state['done']}/{len(todo)}] {path.name}", *lines]), flush=True)
+            locked = [m for m in models if not write_csv(model_rows(records, m, only), csv_path(m, stamp, tag))]
+            print("\n".join([f"[{state['done']}/{len(todo)}] {video.name}", *lines]), flush=True)
             if locked:
                 print(f"  (CSV open in another program, skipped update; results are safe in {JSONL_PATH.name})")
 
     with ThreadPoolExecutor(max(1, args.workers)) as pool:
-        for path, missing in todo:
-            pool.submit(process, path, missing)
+        for video, missing in todo:
+            pool.submit(process, video, missing)
 
     print(f"\nDone. {state['failures']} model runs failed. Results:")
     for m in models:
-        out = csv_path(m, stamp)
-        if not write_csv(model_rows(records, m), out):
-            out = csv_path(m, run_stamp())
-            write_csv(model_rows(records, m), out)
-            print(f"  ({csv_path(m, stamp).name} is open in another program; wrote a new copy instead.)")
+        out = csv_path(m, stamp, tag)
+        if not write_csv(model_rows(records, m, only), out):
+            out = csv_path(m, run_stamp(), tag)
+            write_csv(model_rows(records, m, only), out)
+            print(f"  ({csv_path(m, stamp, tag).name} is open in another program; wrote a new copy instead.)")
         print(f"  {out}")
     return 1 if state["failures"] else 0
 

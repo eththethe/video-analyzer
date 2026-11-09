@@ -1,6 +1,6 @@
 """Export lifetime Meta ad performance for every ad account the token can see.
 
-Writes two CSVs to judging/results/, stamped with the run time so earlier
+Writes two CSVs to judging/results/result_meta-ads/, stamped with the run time so earlier
 exports are never overwritten:
     meta_ads_<YYYYmmdd_HHMMSS>.csv        one row per ad that delivered: account,
                         campaign, ad set, ad, video, delivery period,
@@ -45,6 +45,7 @@ from gemini import RESULTS_DIR, load_dotenv, run_stamp
 
 API = "https://graph.facebook.com/v26.0"
 RAW_DIR = RESULTS_DIR / "meta_raw"
+META_DIR = RESULTS_DIR / "result_meta-ads"
 
 ALL_STATUSES = ["ACTIVE", "PAUSED", "DELETED", "PENDING_REVIEW", "DISAPPROVED", "PREAPPROVED",
                 "PENDING_BILLING_INFO", "CAMPAIGN_PAUSED", "ARCHIVED", "ADSET_PAUSED", "IN_PROCESS",
@@ -385,9 +386,9 @@ def main() -> None:
     rows.sort(key=lambda r: (r["account_id"], -r["spend"]))
 
     stamp = run_stamp()
-    out_csv = RESULTS_DIR / f"meta_ads_{stamp}.csv"
-    daily_csv = RESULTS_DIR / f"meta_ads_daily_{stamp}.csv"
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_csv = META_DIR / f"meta_ads_{stamp}.csv"
+    daily_csv = META_DIR / f"meta_ads_daily_{stamp}.csv"
+    META_DIR.mkdir(parents=True, exist_ok=True)
     with out_csv.open("w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig so Excel shows Malay text/emoji
         writer = csv.DictWriter(f, fieldnames=COLUMNS)
         writer.writeheader()
